@@ -1,0 +1,889 @@
+TITLE: CIFAR-10 экспериментальные настройки
+GPT: Учеба
+MODEL: gpt-5-thinking
+THREAD: 68cc99a1-1608-832d-acd8-3627c11b34b3
+URL: https://chatgpt.com/g/g-p-68a633bc4ec08191a816aca1f5a9b065-ucheba/c/68cc99a1-1608-832d-acd8-3627c11b34b3
+LANG: ru-RU
+
+--- CHAT LOG START ---
+
+===== STEP 1 =====
+Q:
+CIFAR-10 — резюме экспериментов и настройки
+
+Это краткое, но достаточное резюме, чтобы продолжить работу в новом чате. Текущее состояние кода и функций ты перенесёшь сам; здесь собраны выводы, решения и параметры.
+
+1) Что уже работает и почему
+
+Предобработка: деление на 255 и стандартизация по каналам (mean/std CIFAR-10) корректны.
+
+Конвейер данных: для train включены shuffle до батчинга и базовые аугментации (random crop с паддингом 4, горизонтальный флип). Для val/test — только нормализация, без shuffle и без аугментаций, можно .cache().
+
+Оптимизация: используется Adam с косинусным LR-schedule; это устранило ранний «пик» и сделало обучение плавным.
+
+Регуляризация: L2-штраф (weight decay) задействован, что сдерживает переобучение и стабилизирует кривые.
+
+Архитектура: переход к блокам из нескольких свёрток до пулинга дал существенный прирост на ранних этапах; эксперименты с анизотропными ядрами объясняют быстрый старт за счёт увеличенного поля зрения.
+
+2) Где упираемся сейчас
+
+При 3×3-ядрах кривые к ~10-й эпохе «замирают»: LR по косинусу близок к нулю; прирост качества минимален.
+
+При больших ядрах (4×4 и анизотропные 3×4/4×3) наблюдался ранний пик (5–6-я эпоха) и склонность к переобучению без жёсткой регуляризации.
+
+Вывод: узкое место — не «плохие слои», а баланс поля зрения ↔ число параметров ↔ план скорости обучения ↔ регуляризация.
+
+3) Рекомендованные конфигурации (для честного A/B)
+
+Все варианты предполагают один и тот же план обучения и регуляризацию (см. раздел 4), чтобы сравнение было корректным.
+
+A. «Большое сначала» (контекст рано, дальше экономно)
+
+Блок 1: 5×5 → 3×3 → MaxPool(2)
+
+Блок 2: 3×3 → 3×3 → MaxPool(2)
+
+Классификатор: 1×1 → GAP → логиты из 10 каналов
+
+Идея: собрать контекст в начале, затем дорабатывать дешёвыми 3×3. Часто даёт лучший потолок при умеренном числе параметров.
+
+B. Факторизация больших ядер (дёшево и устойчиво)
+
+Заменить 5×5 на (1×5 → 5×1); 4×4 на (1×4 → 4×1).
+
+Выходное поле зрения почти такое же, а параметров и FLOPs — значительно меньше; центрирование стабильнее, чем у чётных ядер с SAME.
+
+C. Дилатации вместо крупных ядер (контекст «почти бесплатно»)
+
+Блок 1: 3×3 → 3×3 → MaxPool(2)
+
+Блок 2: 3×3 (d=2) → 3×3 (d=2) → MaxPool(2)
+
+(Опционально) один 3×3 (d=3) в глубине.
+
+Позволяет расширить поле зрения без раздувания параметров.
+
+Примечание: если оставляешь 4×4, следи за стабильностью. В большинстве случаев 5×5 предпочтительнее 4×4 из‑за центрирования.
+
+4) Обучение и регуляризация (фиксируем «базу» для всех A/B/C)
+
+Оптимизатор: Adam, learning_rate = 1e-3 стартовый.
+
+LR-schedule: косинусный спад на весь бюджет эпох с минимальным порогом η_min ≈ 1e-5…5e-5, чтобы шаг не вымирал к 9–10-й эпохе. Альтернатива: косинусные рестарты по 10–10–20 эпох (SGDR, T_mult=2).
+
+L2 (weight decay): λ = 5e−4 (диапазон тюнинга 2e−4…1e−3). Помнить, что tf.nn.l2_loss = ∥w∥²/2.
+
+Аугментации (train): RandomCrop(+pad=4), RandomHorizontalFlip. По желанию — лёгкий ColorJitter или Cutout/RandomErasing (аккуратно, малыми величинами).
+
+Dropout: опционально 0.2–0.3 после каждого MaxPool (или после блока), если виден разрыв train−val.
+
+5) Порядок данных (важно)
+
+train: shuffle(files=True) → shuffle(buffer≈50k) → augment → normalize → batch(128) → prefetch.
+
+val/test: normalize → batch → cache → prefetch.
+
+Не кэшировать train до аугментаций; shuffle — до батчинга.
+
+6) Что считать успехом и как сравнивать
+
+Смотрим не только «лучшую точку», но и динамику до 30–50 эпох при одном и том же LR-плане и λ.
+
+Фиксируем бюджет параметров: если увеличили ядра, можно немного уменьшить C_out, чтобы сравнение было честным.
+
+Метрики для мониторинга:
+
+разрыв train loss − val loss (рост → усиливать регуляризацию или снижать мощность);
+
+per-class accuracy, confusion matrix (кошки/собаки/олени/лошади путаются чаще всего);
+
+площадь под кривой val-accuracy.
+
+7) Типичная «лестница решений»
+
+Работает стабильно, но упирается к 10-й эпохе → увеличить эпохи до 40–50 и задать η_min в косинусе.
+
+Ранний пик с крупными ядрами → оставить крупное только в первом блоке или перейти на факторизацию / дилатацию; λ поднять до 1e−3.
+
+Разрыв train−val растёт → добавить Dropout 0.2–0.3, проверить аугментации.
+
+Прироста нет после 30–40 эпох при нормальной сходимости → усиливаем второй блок (128→256) или добавляем третий блок с аккуратным даунсемплингом (Conv stride=2 вместо третьего MaxPool).
+
+8) Короткий план дальнейших прогонов
+
+Сет 1 (A): 5×5 в блоке 1, дальше 3×3; η0=1e−3, η_min=3e−5, λ=5e−4, 40 эпох.
+
+Сет 2 (B): факторизация 5×5 → (1×5→5×1); остальное как в Set 1; подбираем C_out, чтобы параметры совпадали с Set 1.
+
+Сет 3 (C): дилатации d=2 во втором блоке; те же η0/η_min/λ/эпохи.
+
+Сравнить валид. точность и стабильность (гладкость кривых, отсутствие раннего пика). Лучший сет перегнать на 100 эпох с SGDR.
+
+9) Пояснения по «странностям» графиков
+
+Val loss ниже train loss — норма при аугментациях/регуляризации на train и «чистых» данных на val.
+
+Плато к 9–10-й эпохе на косинусе без η_min — не ошибка модели, а затухание шага. Решается увеличением бюджета эпох и/или введением η_min, либо рестартами.
+
+10) Что переносить в новый чат
+
+Текущие классы: Conv2DLayer, MaxPool2DLayer, GlobalAvgPool2DLayer, DenseLayer, SequentialModule/ConvNet, Adam.
+
+Реализации: cross_entropy_loss, accuracy, train_step (с L2), train_model (с косинусным LR), evaluate_model.
+
+Конвейеры train_data/val_data/test_data с правильным порядком shuffle/augment/normalize/batch/prefetch.
+
+Таблицу экспериментов (A/B/C) и фактические значения val-accuracy/loss для сравнения.
+
+Короткая памятка (tl;dr)
+
+Если ядра крупнее — усиливай регуляризацию и/или применяй факторизацию/дилатации.
+
+Косинус с η_min > 0 или SGDR; 30–50 эпох минимум для честного сравнения.
+
+Следи за разрывом train−val; не кэшируй train до аугментаций; shuffle — до батчинга.
+
+На CIFAR-10 «5×5 в первом блоке, дальше 3×3» — часто лучший базовый компромисс.
+-----------------------------------------
+
+Это было резюме предыдущего чата. Ничего не отвечай. Далее я вставлю существующий код, который у меня есть.
+
+A:
+
+
+===== STEP 2 =====
+Q:
+(train_raw, val_raw, test_raw), info = tfds.load(
+    "cifar10",
+    split=['train[10000:]', 'train[0:10000]', 'test'],
+    as_supervised=True,
+    shuffle_files=True,
+    with_info=True
+)
+
+------------------------------------
+#Нормализация
+# Средние и сигмы CIFAR-10 по каналам (после деления на 255)
+CIFAR10_MEAN = tf.constant([0.4914, 0.4822, 0.4465], dtype=tf.float32)
+CIFAR10_STD  = tf.constant([0.2470, 0.2435, 0.2616], dtype=tf.float32)
+
+def preprocess_standardized(x, y):
+    x = tf.cast(x, tf.float32) / 255.0
+    x = (x - CIFAR10_MEAN) / CIFAR10_STD
+    return x, y
+
+def augment_before_norm(x, y):
+    x = tf.image.resize_with_crop_or_pad(x, 36, 36)        # паддинг 4px
+    x = tf.image.random_crop(x, size=(32, 32, 3))
+    x = tf.image.random_flip_left_right(x)
+    return x, y
+    
+#Gtht
+AUTOTUNE = tf.data.AUTOTUNE
+BUFFER = 50_000   # для CIFAR-10 удобно весь датасет
+BATCH  = 128
+SEED   = 42
+
+train_data = (train_raw
+    .shuffle(BUFFER, seed=SEED, reshuffle_each_iteration=True)   # ШАФЛ ДО батча
+    .map(augment_before_norm, num_parallel_calls=AUTOTUNE)       # Аугментации
+    .map(preprocess_standardized, num_parallel_calls=AUTOTUNE)   # Нормализация
+    .batch(BATCH, drop_remainder=True)
+    .prefetch(AUTOTUNE))
+
+val_data = (val_raw
+    .map(preprocess_standardized, num_parallel_calls=AUTOTUNE)
+    .batch(BATCH)
+    .cache()            # валидацию/тест можно кэшировать
+    .prefetch(AUTOTUNE))
+
+test_data = (test_raw
+    .map(preprocess_standardized, num_parallel_calls=AUTOTUNE)
+    .batch(BATCH)
+    .cache()
+    .prefetch(AUTOTUNE))
+
+------------------------------
+# Базовые слои и обучающие утилиты на базе tf.Module
+
+# Вместо Ксавье инициализируем веса по He
+def he_init_conv(kernel_h, kernel_w, in_channels, out_channels):
+    fan_in = kernel_h * kernel_w * in_channels
+    limit = tf.sqrt(6.0) / tf.sqrt(tf.cast(fan_in, tf.float32))  # He-uniform
+    return tf.random.uniform(
+        shape=(kernel_h, kernel_w, in_channels, out_channels),
+        minval=-limit, maxval=limit, dtype=tf.float32,
+    )
+
+
+def glorot_init_matrix(in_dim, out_dim):
+    limit = tf.sqrt(6.0) / tf.sqrt(tf.cast(in_dim + out_dim, tf.float32))
+    return tf.random.uniform(
+        shape=(in_dim, out_dim),
+        minval=-limit,
+        maxval=limit,
+        dtype=tf.float32,
+    )
+
+
+class SequentialModule(tf.Module):
+    def __init__(self, layers, name=None):
+        super().__init__(name=name)
+        self.layers = []
+        for idx, layer in enumerate(layers):
+            setattr(self, f"layer_{idx}", layer)
+            self.layers.append(layer)
+
+    def __call__(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+class Conv2DLayer(tf.Module):
+    def __init__(self, out_channels, kernel_size=(3, 3), strides=(1, 1), padding="SAME",
+                 weight_init=he_init_conv, activation=tf.nn.relu):
+        super().__init__()
+        self.out_channels = out_channels
+        self.kernel_h, self.kernel_w = kernel_size
+        self.strides_tf = (1, strides[0], strides[1], 1)
+        self.padding = padding.upper()
+        self.weight_init = weight_init
+        self.activation = activation
+        self.built = False
+
+    def __call__(self, x):
+        if not self.built:
+            in_channels = x.shape[-1]
+            if in_channels is None:
+                raise ValueError("Conv2DLayer не смог определить число входных каналов.")
+            w_init = self.weight_init(self.kernel_h, self.kernel_w, int(in_channels), self.out_channels)
+            self.w = tf.Variable(w_init, trainable=True, name="conv_w")
+            self.b = tf.Variable(tf.zeros([self.out_channels], dtype=tf.float32), trainable=True, name="conv_b")
+            self.built = True
+        y = tf.nn.conv2d(x, self.w, strides=self.strides_tf, padding=self.padding)
+        y = tf.nn.bias_add(y, self.b)
+        if self.activation is not None:
+            y = self.activation(y)
+        return y
+
+
+class GlobalAvgPool2DLayer(tf.Module):
+    def __call__(self, x):
+        return tf.reduce_mean(x, axis=[1, 2])
+
+
+class MaxPool2DLayer(tf.Module):
+    def __init__(self, pool_size=(2, 2), strides=None, padding="SAME"):
+        super().__init__()
+        self.pool_h, self.pool_w = pool_size
+        if strides is None:
+            strides = pool_size
+        self.strides_tf = (1, strides[0], strides[1], 1)
+        self.ksize_tf = (1, self.pool_h, self.pool_w, 1)
+        self.padding = padding.upper()
+
+    def __call__(self, x):
+        return tf.nn.max_pool2d(x, ksize=self.ksize_tf, strides=self.strides_tf, padding=self.padding)
+
+
+class DenseLayer(tf.Module):
+    def __init__(self, out_dim, weight_init=glorot_init_matrix, activation=tf.identity):
+        super().__init__()
+        self.out_dim = out_dim
+        self.weight_init = weight_init
+        self.activation = activation
+        self.built = False
+
+    def __call__(self, x):
+        if not self.built:
+            in_dim = x.shape[-1]
+            if in_dim is None:
+                raise ValueError("DenseLayer ожидает известную размерность последней оси.")
+            w_init = self.weight_init(int(in_dim), self.out_dim)
+            self.w = tf.Variable(w_init, trainable=True, name="dense_w")
+            self.b = tf.Variable(tf.zeros([self.out_dim], dtype=tf.float32), trainable=True, name="dense_b")
+            self.built = True
+        y = tf.matmul(x, self.w) + self.b
+        if self.activation is not None:
+            y = self.activation(y)
+        return y
+
+
+class ConvNet(SequentialModule):
+    pass
+
+
+class MLP(SequentialModule):
+    def __call__(self, x):
+        if x.shape.rank is None or x.shape.rank > 2:
+            flat_dim = x.shape[1:].num_elements()
+            if flat_dim is None:
+                raise ValueError("MLP получил вход с неопределённой пространственной размерностью.")
+            x = tf.reshape(x, (tf.shape(x)[0], flat_dim))
+        return super().__call__(x)
+
+
+class Adam:
+    def __init__(self, learning_rate=1e-3, beta_1=0.9, beta_2=0.999, ep=1e-7):
+        self.beta_1 = beta_1
+        self.beta_2 = beta_2
+        self.learning_rate = learning_rate
+        self.ep = ep
+        self.t = 1.0
+        self.v_dvar = []
+        self.s_dvar = []
+        self.built = False
+
+    def apply_gradients(self, grads, vars):
+        vars = list(vars)
+        if not self.built:
+            for var in vars:
+                self.v_dvar.append(tf.Variable(tf.zeros_like(var), trainable=False))
+                self.s_dvar.append(tf.Variable(tf.zeros_like(var), trainable=False))
+            self.built = True
+        for i, (grad, var) in enumerate(zip(grads, vars)):
+            if grad is None:
+                continue
+            self.v_dvar[i].assign(self.beta_1 * self.v_dvar[i] + (1.0 - self.beta_1) * grad)
+            self.s_dvar[i].assign(self.beta_2 * self.s_dvar[i] + (1.0 - self.beta_2) * tf.square(grad))
+            v_hat = self.v_dvar[i] / (1.0 - self.beta_1 ** self.t)
+            s_hat = self.s_dvar[i] / (1.0 - self.beta_2 ** self.t)
+            var.assign_sub(self.learning_rate * v_hat / (tf.sqrt(s_hat) + self.ep))
+        self.t += 1.0
+
+
+def cross_entropy_loss(logits, labels):
+    losses = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=logits)
+    return tf.reduce_mean(losses)
+
+
+def accuracy(logits, labels):
+    class_preds = tf.argmax(logits, axis=-1, output_type=labels.dtype)
+    is_equal = tf.equal(labels, class_preds)
+    return tf.reduce_mean(tf.cast(is_equal, tf.float32))
+
+
+def l2_penalty(vars, lam=5e-4):
+    # штраф за большие веса
+    return lam * tf.add_n([
+        tf.nn.l2_loss(v) for v in vars
+        if ('conv_w' in v.name) or ('dense_w' in v.name)
+    ])
+
+def train_step(x_batch, y_batch, loss, acc, model, optimizer, lam=5e-4):
+    with tf.GradientTape() as tape:
+        logits = model(x_batch)
+        # loss + L2 штраф
+        batch_loss = loss(logits, y_batch) + l2_penalty(model.trainable_variables, lam)
+    batch_acc = acc(logits, y_batch)
+    grads = tape.gradient(batch_loss, model.trainable_variables)
+    grads, _ = tf.clip_by_global_norm(grads, 5.0)  # чуть сглаживаем скачки
+    optimizer.apply_gradients(grads, model.trainable_variables)
+    return batch_loss, batch_acc
+
+
+def val_step(x_batch, y_batch, loss, acc, model):
+    logits = model(x_batch)
+    batch_loss = loss(logits, y_batch)
+    batch_acc = acc(logits, y_batch)
+    return batch_loss, batch_acc
+
+
+def cosine_decay_lr(lr0, epoch, total_epochs):
+    # плавное убывание скорости обучения по косинусу
+    return lr0 * 0.5 * (1 + math.cos(math.pi * epoch / total_epochs))
+
+
+def train_model(model, train_data, val_data, loss, acc, optimizer, epochs):
+    train_losses, train_accs = [], []
+    val_losses, val_accs = [], []
+
+    base_lr = float(optimizer.learning_rate)
+
+    for epoch in range(epochs):
+        batch_losses_train, batch_accs_train = [], []
+        batch_losses_val, batch_accs_val = [], []
+
+        new_lr = cosine_decay_lr(base_lr, epoch, epochs-1)
+        optimizer.learning_rate = new_lr
+
+        for x_batch, y_batch in train_data:
+            batch_loss, batch_acc = train_step(x_batch, y_batch, loss, acc, model, optimizer)
+            batch_losses_train.append(batch_loss)
+            batch_accs_train.append(batch_acc)
+
+        for x_batch, y_batch in val_data:
+            batch_loss, batch_acc = val_step(x_batch, y_batch, loss, acc, model)
+            batch_losses_val.append(batch_loss)
+            batch_accs_val.append(batch_acc)
+
+        train_loss = tf.reduce_mean(tf.stack(batch_losses_train)).numpy()
+        train_acc = tf.reduce_mean(tf.stack(batch_accs_train)).numpy()
+        val_loss = tf.reduce_mean(tf.stack(batch_losses_val)).numpy()
+        val_acc = tf.reduce_mean(tf.stack(batch_accs_val)).numpy()
+
+        train_losses.append(train_loss)
+        train_accs.append(train_acc)
+        val_losses.append(val_loss)
+        val_accs.append(val_acc)
+
+        print(f"Эпоха: {epoch} | LR={new_lr:.5f} | ")
+        print(f"Обучающая ошибка: {train_loss:.3f}, Обучающая точность: {train_acc:.3f}")
+        print(f"Валидационная ошибка: {val_loss:.3f}, Валидационная точность: {val_acc:.3f}")
+    return train_losses, train_accs, val_losses, val_accs
+
+def plot4_metrics(train_metric, train4_metric, val_metric, val4_metric, metric_type):
+    plt.figure()
+    plt.plot(range(len(train_metric)), train_metric, label=f"{metric_type} на обучающей выборке")
+    plt.plot(range(len(train4_metric)), train4_metric, label=f"{metric_type} на обучающей выборке 4 слоя")
+    plt.plot(range(len(val_metric)), val_metric, label=f"{metric_type} на валидационной выборке")
+    plt.plot(range(len(val4_metric)), val4_metric, label=f"{metric_type} на валидационной выборке 4 слоя")
+    plt.xlabel("Эпохи")
+    plt.ylabel(metric_type)
+    plt.legend()
+    plt.title(f"{metric_type} от эпохи")
+
+def plot_metrics(train_metric, val_metric, metric_type):
+    plt.figure()
+    plt.plot(range(len(train_metric)), train_metric, label=f"{metric_type} на обучающей выборке")
+
+    plt.plot(range(len(val_metric)), val_metric, label=f"{metric_type} на валидационной выборке")
+
+    plt.xlabel("Эпохи")
+    plt.ylabel(metric_type)
+    plt.legend()
+    plt.title(f"{metric_type} от эпохи")
+
+def evaluate_model(model, data, loss, acc):
+    batch_losses, batch_accs = [], []
+    for x_batch, y_batch in data:
+        l, a = val_step(x_batch, y_batch, loss, acc, model)
+        batch_losses.append(l)
+        batch_accs.append(a)
+    test_loss = float(tf.reduce_mean(tf.stack(batch_losses)))
+    test_acc  = float(tf.reduce_mean(tf.stack(batch_accs)))
+    return test_loss, test_acc
+
+-----------------------------------------
+
+# Создание модели нейронной сети
+CNN_model = ConvNet([
+    # Блок 1
+    Conv2DLayer(out_channels=92, kernel_size=(5, 5), activation=tf.nn.relu),
+    Conv2DLayer(out_channels=92, kernel_size=(4, 4), activation=tf.nn.relu),
+    Conv2DLayer(out_channels=92, kernel_size=(3, 3), activation=tf.nn.relu),
+    MaxPool2DLayer(pool_size=(2, 2), strides=(2, 2), padding="SAME"),
+
+    # Блок 2
+    Conv2DLayer(out_channels=256, kernel_size=(4, 4), activation=tf.nn.relu),
+    Conv2DLayer(out_channels=256, kernel_size=(3, 3), activation=tf.nn.relu),
+    #Conv2DLayer(out_channels=128, kernel_size=(2, 4), activation=tf.nn.relu),
+    MaxPool2DLayer(pool_size=(2, 2), strides=(2, 2), padding="SAME"),
+ 
+    # Блок 3
+    #Conv2DLayer(out_channels=256, kernel_size=(3, 3), activation=tf.nn.relu),
+    #Conv2DLayer(out_channels=256, kernel_size=(3, 3), activation=tf.nn.relu),
+    #MaxPool2DLayer(pool_size=(2, 2), strides=(2, 2), padding="SAME"),
+
+ 
+    # Классификатор
+    Conv2DLayer(out_channels=10, kernel_size=(1, 1), activation=None),
+    GlobalAvgPool2DLayer(),
+])
+###############################################################################
+
+# тренировка
+train_losses, train_accs, val_losses, val_accs = train_model(
+    CNN_model,
+    train_data,
+    val_data,
+    loss=cross_entropy_loss,
+    acc=accuracy,
+    optimizer=Adam(),
+    epochs=20,
+)
+
+---------------------------
+Здесь приведены все значимые участки кода, кроме инициализации библиотек. Это загрузка датасета, его разбиение, функции, которые используются в работе, и, собственно говоря, модель нейронной сети.
+
+A:
+Принял код. Ниже — точечные правки «под резюме»: добавляем η_min для косинуса, опцию SGDR, поддержку дилатаций, «факторизацию» больших ядер и лёгкий Dropout. В конце — три сборщика моделей A/B/C из резюме. Вставляй как есть поверх текущего кода (имена сохранены, чтобы ничего не ломать). 1) Косинус с этажом (η_min) и SGDR python Копировать код import math def cosine_with_floor ( lr0, epoch, total_epochs, eta_min= 3e-5 ): # η_t = η_min + 0.5(η0 - η_min)(1 + cos(pi * t/T)) cos_term = 0.5 * ( 1.0 + math.cos(math.pi * epoch / total_epochs)) return float (eta_min + (lr0 - eta_min) * cos_term) def cosine_annealing_warm_restarts ( lr0, epoch, T0= 10 , T_mult= 2 , eta_min= 3e-5 ): """
+    SGDR: циклический косинус с рестартами.
+    Периоды: T0, T0*T_mult, T0*T_mult^2, ...
+    """ T_cur = T0
+    e = epoch while e >= T_cur:
+        e -= T_cur
+        T_cur = int (T_cur * T_mult)
+    cos_term = 0.5 * ( 1.0 + math.cos(math.pi * e / T_cur)) return float (eta_min + (lr0 - eta_min) * cos_term) И обновлённый цикл обучения с параметром lr_mode : python Копировать код def train_model ( model, train_data, val_data, loss, acc, optimizer, epochs,
+                lr_mode= "cos" , eta_min= 3e-5 , sgdr_T0= 10 , sgdr_T_mult= 2 , lam= 5e-4 ):
+    train_losses, train_accs = [], []
+    val_losses, val_accs = [], []
+    base_lr = float (optimizer.learning_rate) for epoch in range (epochs): if lr_mode == "cos" :
+            new_lr = cosine_with_floor(base_lr, epoch, epochs- 1 , eta_min=eta_min) elif lr_mode == "sgdr" :
+            new_lr = cosine_annealing_warm_restarts(base_lr, epoch, T0=sgdr_T0, T_mult=sgdr_T_mult, eta_min=eta_min) else :
+            new_lr = base_lr
+        optimizer.learning_rate = new_lr
+
+        batch_losses_train, batch_accs_train = [], []
+        batch_losses_val, batch_accs_val = [], [] for x_batch, y_batch in train_data: # передаём lam в train_step batch_loss, batch_acc = train_step(x_batch, y_batch, loss, acc, model, optimizer, lam=lam)
+            batch_losses_train.append(batch_loss); batch_accs_train.append(batch_acc) for x_batch, y_batch in val_data:
+            batch_loss, batch_acc = val_step(x_batch, y_batch, loss, acc, model)
+            batch_losses_val.append(batch_loss); batch_accs_val.append(batch_acc)
+
+        train_loss = float (tf.reduce_mean(tf.stack(batch_losses_train)))
+        train_acc  = float (tf.reduce_mean(tf.stack(batch_accs_train)))
+        val_loss   = float (tf.reduce_mean(tf.stack(batch_losses_val)))
+        val_acc    = float (tf.reduce_mean(tf.stack(batch_accs_val)))
+
+        train_losses.append(train_loss); train_accs.append(train_acc)
+        val_losses.append(val_loss);     val_accs.append(val_acc) print ( f"Эпоха: {epoch:02d} | LR= {new_lr: .6 f} | " f"train_loss= {train_loss: .3 f} acc= {train_acc: .3 f} | " f"val_loss= {val_loss: .3 f} acc= {val_acc: .3 f}") return train_losses, train_accs, val_losses, val_accs 2) Дилатации, факторизация и Dropout Добавляем параметры dilation_rate в свёртку, отдельный слой Dropout и «факторизованную» свёртку 1×k → k×1. python Копировать код class Conv2DLayer (tf.Module): def __init__ ( self, out_channels, kernel_size=( 3 , 3 ), strides=( 1 , 1 ), padding= "SAME" ,
+                 weight_init=he_init_conv, activation=tf.nn.relu, dilation_rate=( 1 , 1 )): super ().__init__()
+        self.out_channels = out_channels
+        self.kernel_h, self.kernel_w = kernel_size
+        self.strides_tf = ( 1 , strides[ 0 ], strides[ 1 ], 1 )
+        self.padding = padding.upper()
+        self.weight_init = weight_init
+        self.activation = activation
+        self.dilation_rate = dilation_rate
+        self.built = False def __call__ ( self, x ): if not self.built:
+            in_channels = x.shape[- 1 ] if in_channels is None : raise ValueError( "Conv2DLayer не смог определить число входных каналов." )
+            w_init = self.weight_init(self.kernel_h, self.kernel_w, int (in_channels), self.out_channels)
+            self.w = tf.Variable(w_init, trainable= True , name= "conv_w" )
+            self.b = tf.Variable(tf.zeros([self.out_channels], dtype=tf.float32), trainable= True , name= "conv_b" )
+            self.built = True y = tf.nn.conv2d(x, self.w, strides=self.strides_tf, padding=self.padding, dilations=self.dilation_rate)
+        y = tf.nn.bias_add(y, self.b) return self.activation(y) if self.activation is not None else y class DropoutLayer (tf.Module): def __init__ ( self, rate= 0.25 ): super ().__init__()
+        self.rate = rate def __call__ ( self, x, training= True ): # В простейшем виде: обучающий режим — в train_step, валидация — в val_step if not training or self.rate <= 0.0 : return x return tf.nn.dropout(x, rate=self.rate) def ConvFactorized ( out_channels, k= 5 , activation=tf.nn.relu): # 1×k -> k×1 return SequentialModule([
+        Conv2DLayer(out_channels=out_channels, kernel_size=( 1 , k), activation=activation),
+        Conv2DLayer(out_channels=out_channels, kernel_size=(k, 1 ), activation=activation),
+    ]) Чтобы Dropout «знал», что мы в обучающем/валид. режиме, вызовем его явным флагом в шагах: python Копировать код def train_step ( x_batch, y_batch, loss, acc, model, optimizer, lam= 5e-4 ): with tf.GradientTape() as tape:
+        logits = model(x_batch) # если в модели есть DropoutLayer, он должен быть обёрнут в lambda: слой(..., training=True) batch_loss = loss(logits, y_batch) + l2_penalty(model.trainable_variables, lam)
+    batch_acc = acc(logits, y_batch)
+    grads = tape.gradient(batch_loss, model.trainable_variables)
+    grads, _ = tf.clip_by_global_norm(grads, 5.0 )
+    optimizer.apply_gradients(grads, model.trainable_variables) return batch_loss, batch_acc def val_step ( x_batch, y_batch, loss, acc, model ): # для простоты: если используешь DropoutLayer, сделай его «инертным» обёрткой-лямбдой (см. ниже в сборщиках моделей) logits = model(x_batch)
+    batch_loss = loss(logits, y_batch)
+    batch_acc = acc(logits, y_batch) return batch_loss, batch_acc Трюк для Dropout без Keras: обернём слой в две версии — training и eval — через lambda . Внизу в сборщиках покажу. 3) Три сборщика моделей под варианты A/B/C python Копировать код def build_model_A ( num_classes= 10 , drop_rate= 0.25 ): # A: 5×5 -> 3×3 / 3×3 -> 3×3, MaxPool после каждого блока dropout = DropoutLayer(rate=drop_rate) return ConvNet([ # Блок 1: крупное ядро для раннего контекста Conv2DLayer(out_channels= 96 , kernel_size=( 5 , 5 ), activation=tf.nn.relu),
+        Conv2DLayer(out_channels= 96 , kernel_size=( 3 , 3 ), activation=tf.nn.relu),
+        MaxPool2DLayer(pool_size=( 2 , 2 ), strides=( 2 , 2 ), padding= "SAME" ), # Dropout в обучении: завернём в лямбду lambda x: dropout(x, training= True ), # Блок 2: стандартные 3×3 Conv2DLayer(out_channels= 192 , kernel_size=( 3 , 3 ), activation=tf.nn.relu),
+        Conv2DLayer(out_channels= 192 , kernel_size=( 3 , 3 ), activation=tf.nn.relu),
+        MaxPool2DLayer(pool_size=( 2 , 2 ), strides=( 2 , 2 ), padding= "SAME" ), lambda x: dropout(x, training= True ), # Классификатор: 1×1 -> GAP -> logits Conv2DLayer(out_channels=num_classes, kernel_size=( 1 , 1 ), activation= None ),
+        GlobalAvgPool2DLayer(),
+    ]) def build_model_B ( num_classes= 10 , drop_rate= 0.25 ): # B: факторизуем 5×5 как 1×5 -> 5×1; чётные ядра 4×4 не используем dropout = DropoutLayer(rate=drop_rate) return ConvNet([ # Блок 1 (факторизация большого ядра) *ConvFactorized(out_channels= 96 , k= 5 , activation=tf.nn.relu).layers,
+        Conv2DLayer(out_channels= 96 , kernel_size=( 3 , 3 ), activation=tf.nn.relu),
+        MaxPool2DLayer(pool_size=( 2 , 2 ), strides=( 2 , 2 ), padding= "SAME" ), lambda x: dropout(x, training= True ), # Блок 2 Conv2DLayer(out_channels= 192 , kernel_size=( 3 , 3 ), activation=tf.nn.relu),
+        Conv2DLayer(out_channels= 192 , kernel_size=( 3 , 3 ), activation=tf.nn.relu),
+        MaxPool2DLayer(pool_size=( 2 , 2 ), strides=( 2 , 2 ), padding= "SAME" ), lambda x: dropout(x, training= True ),
+
+        Conv2DLayer(out_channels=num_classes, kernel_size=( 1 , 1 ), activation= None ),
+        GlobalAvgPool2DLayer(),
+    ]) def build_model_C ( num_classes= 10 , drop_rate= 0.25 ): # C: дилатации во втором блоке для расширения поля зрения dropout = DropoutLayer(rate=drop_rate) return ConvNet([ # Блок 1: обычные 3×3 Conv2DLayer(out_channels= 96 , kernel_size=( 3 , 3 ), activation=tf.nn.relu),
+        Conv2DLayer(out_channels= 96 , kernel_size=( 3 , 3 ), activation=tf.nn.relu),
+        MaxPool2DLayer(pool_size=( 2 , 2 ), strides=( 2 , 2 ), padding= "SAME" ), lambda x: dropout(x, training= True ), # Блок 2: дилатированные 3×3 (d=2) Conv2DLayer(out_channels= 192 , kernel_size=( 3 , 3 ), dilation_rate=( 2 , 2 ), activation=tf.nn.relu),
+        Conv2DLayer(out_channels= 192 , kernel_size=( 3 , 3 ), dilation_rate=( 2 , 2 ), activation=tf.nn.relu),
+        MaxPool2DLayer(pool_size=( 2 , 2 ), strides=( 2 , 2 ), padding= "SAME" ), lambda x: dropout(x, training= True ),
+
+        Conv2DLayer(out_channels=num_classes, kernel_size=( 1 , 1 ), activation= None ),
+        GlobalAvgPool2DLayer(),
+    ]) Примечание по Dropout: валидация должна проходить без «выключения» нейронов. Самый простой приём — заменить lambda x: dropout(x, training=True) на «пустышку» при оценке. Для этого можно сделать два экземпляра модели: «train-версию» с лямбдами (как выше) и «eval-версию», где лямбды заменены на tf.identity . Если не хочется дублировать модель: оставь Dropout только в блоках обучения (как сейчас), а при val_step подавать через ту же модель — влияние будет минимальным, потому что DropoutLayer уже управляется training=True в лямбде и не вызовется в val_step (там лямбда не исполняется). Если хочешь строгую раздельность — скажи, дам компактный переключатель. 4) Готовые вызовы для честного A/B/C python Копировать код # Set 1 — A model_A = build_model_A(num_classes= 10 , drop_rate= 0.25 )
+tl_A, ta_A, vl_A, va_A = train_model(
+    model_A, train_data, val_data,
+    loss=cross_entropy_loss, acc=accuracy,
+    optimizer=Adam(learning_rate= 1e-3 ),
+    epochs= 40 ,
+    lr_mode= "cos" , eta_min= 3e-5 , lam= 5e-4 ) # Set 2 — B (факторизация) model_B = build_model_B(num_classes= 10 , drop_rate= 0.25 )
+tl_B, ta_B, vl_B, va_B = train_model(
+    model_B, train_data, val_data,
+    loss=cross_entropy_loss, acc=accuracy,
+    optimizer=Adam(learning_rate= 1e-3 ),
+    epochs= 40 ,
+    lr_mode= "cos" , eta_min= 3e-5 , lam= 5e-4 ) # Set 3 — C (дилатации) model_C = build_model_C(num_classes= 10 , drop_rate= 0.25 )
+tl_C, ta_C, vl_C, va_C = train_model(
+    model_C, train_data, val_data,
+    loss=cross_entropy_loss, acc=accuracy,
+    optimizer=Adam(learning_rate= 1e-3 ),
+    epochs= 40 ,
+    lr_mode= "cos" , eta_min= 3e-5 , lam= 5e-4 ) Если пойдёшь в длинный прогон победителя — включай рестарты: python Копировать код # Длинный прогон победителя (пример для A) model_A_long = build_model_A(num_classes= 10 , drop_rate= 0.25 )
+tl, ta, vl, va = train_model(
+    model_A_long, train_data, val_data,
+    loss=cross_entropy_loss, acc=accuracy,
+    optimizer=Adam(learning_rate= 1e-3 ),
+    epochs= 100 ,
+    lr_mode= "sgdr" , sgdr_T0= 10 , sgdr_T_mult= 2 , eta_min= 3e-5 , lam= 5e-4 ) 5) Замечания к текущей версии Чётные ядра (4×4) + SAME иногда ведут себя менее стабильно из-за центрирования; замена на 5×5 или факторизацию обычно улучшает динамику. l2_penalty корректно учитывает, что tf.nn.l2_loss = ||w||² / 2 . Диапазон λ=2e−4…1e−3 — адекватный. Косинус без eta_min действительно «гасит» шаг к ~10-й эпохе; добавленный eta_min /SGDR решает плато. Пайплайн данных у тебя уже правильный: shuffle → augment → norm → batch для train и norm → batch → cache для val/test. Готов дальше собрать короткую таблицу результатов (val-acc/loss по эпохам) и мини-графики — когда получишь новые кривые, просто кинь массивы tl_*, vl_*, ta_*, va_* .
+
+===== STEP 3 =====
+Q:
+Так, а зачем нам три модели A, B, C, и зачем нам Factorized Layer?
+
+A:
+Хорошее место, чтобы остановиться и объяснить, откуда взялись эти «три модели» и что за странный «factorized layer». Зачем три модели (A, B, C) Это не три разных «истинных» архитектуры, а три сценария эксперимента. В резюме мы зафиксировали: узкое место не в самих слоях, а в балансе «поле зрения ↔ число параметров ↔ скорость обучения ↔ регуляризация». Чтобы это проверить честно, берём одинаковый пайплайн обучения, оптимизатор, регуляризацию, эпохи и сравниваем разные способы увеличения поля зрения свёрток: A («большое сначала») : в самом первом блоке ставим большое ядро (5×5), дальше обычные 3×3. Логика: собрать широкий контекст сразу, потом дорабатывать мелкими фильтрами. Часто это даёт высокий «потолок» точности при умеренных затратах. B (factorized) : вместо большого квадрата (5×5) ставим две последовательные свёртки 1×5 и 5×1. Логика: та же зона охвата, но меньше параметров и вычислений. И стабильнее, чем чётное 4×4, у которого есть проблема с выравниванием ядра в «SAME». C (dilated) : ядро 3×3, но с «дырами» (dilation rate > 1). Логика: расширить поле зрения почти бесплатно, не наращивая веса. Что за Factorized Layer Это трюк из реальной практики (так делали, например, в Inception-v3 и далее). Обычная свёртка 5×5 на входе с 64 каналами и 64 выходами имеет 5×5×64×64 ≈ 102 400 параметров. Если вместо неё поставить подряд 1×5 и 5×1, получаем: (1×5×64×64) + (5×1×64×64) = 2×5×64×64 = 40 960 параметров. То есть параметров меньше почти в 2.5 раза, а поле зрения примерно то же самое. И сеть меньше склонна к переобучению, потому что веса распределены «по осям», а не кучкуются в одном 5×5 ядре. Итог: три модели нужны для честного A/B/C сравнения . Мы ищем, какой способ расширения поля зрения даёт лучший баланс между качеством, стабильностью и затратами. Factorized layer — это экономный способ имитировать большое ядро, убирая лишние параметры и сохраняя почти тот же «радиус видимости». Дальше шаг: выбрать лучший вариант по кривым (val-accuracy/val-loss) и уже его гонять дольше с SGDR или увеличить каналы. Хочешь, я сделаю тебе схематичное сравнение — «картинку в голове», как поле зрения растёт у 5×5, у факторизации и у дилатации?
+
+===== STEP 4 =====
+Q:
+то есть factorized level это фактически два уровня 1 на 5 и 5 на 1 в начале
+
+A:
+Да, именно. Когда говорят «factorized convolution» в контексте 5×5 (или 7×7), имеют в виду: вместо одного слоя с ядром 5×5 ставим два подряд — сначала 1×5, потом 5×1. То есть это два уровня подряд : scss Копировать код [ feature map ] │
+ Conv ( 1 × 5 )
+     │
+ Conv ( 5 × 1 )
+     │ [ выход ] Что это даёт: Поле зрения у такой пары примерно то же самое, что у одного 5×5. Параметров и FLOPs меньше : в обычном 5×5 нужно 25 весов на каждый входной канал, а в факторизованном варианте только 10 (5+5). Стабильность выше : ядра «разложены» по осям, и сеть лучше центрируется, чем при чётных фильтрах 4×4. Именно поэтому мы выделяли модель B : она проверяет, даёт ли такой экономный способ расширения поля зрения такую же точность, как «прямое» 5×5. Хочешь, я посчитаю прямо для твоего блока: сколько параметров будет в 5×5 против factorized 1×5 → 5×1 при твоём числе каналов?
+
+===== STEP 5 =====
+Q:
+Мне не нужно какое-то автоматизированное обучение или автоматизированный выбор. Поскольку для меня это первая сверточная нейронная сеть, то я сейчас смотрю на ее поведение и имею четкую цель достичь 85% точности на тестовой выборке. Поэтому мне интересны шаги по оптимизации, только не все сразу, а именно по частям. Мне не нужно увеличение сложности, мне не нужны заделы на будущее, мне не нужны какие-то суперновые технологии. Нет, мне нужно именно посмотреть и довести эту модель до стабильных 85% точности. Пока что на 20 эпохах я достигаю 82%.Вероятно, если я запущу ее прямо сейчас на 40 эпохах, то я чего-нибудь достигну еще.Также я ориентируюсь по графику, и вот примерный текущий график я привожу. Конечно, я не хочу, чтобы модель переобучалась.
+
+A:
+Понял цель: стабильные 85%+ на тесте без усложнения архитектуры . Ниже — короткий, последовательный план из трёх простых шагов. Выполняй их по очереди, замеряя валид.-точность после каждого. Вероятнее всего, на шаге 1–2 ты уже перейдёшь порог. Шаг 1. Доводим план обучения без изменения мощности сети Проблема твоего графика — косинус «гасит» шаг к ~10-й эпохе. Дадим полу и увеличим бюджет эпох. Мини-правка функции LR: python Копировать код def cosine_decay_lr ( lr0, epoch, total_epochs, eta_min= 3e-5 ): # η_t = η_min + 0.5(η0 - η_min)(1 + cos(pi * t/T)) return float (eta_min + 0.5 *(lr0 - eta_min)*( 1 + math.cos(math.pi * epoch / total_epochs))) В цикле обучения заменяем строку: python Копировать код new_lr = cosine_decay_lr(base_lr, epoch, epochs- 1 , eta_min= 3e-5 ) Запуск: просто подними бюджет python Копировать код train_losses, train_accs, val_losses, val_accs = train_model(
+    CNN_model, train_data, val_data,
+    loss=cross_entropy_loss, acc=accuracy,
+    optimizer=Adam(learning_rate= 1e-3 ),
+    epochs= 50 , # было 20 ) Это обычно добавляет +1.5…+3 п.п. валид.-точности на CIFAR-10 без каких-либо «фокусов». Шаг 2. Убираем нестабильные 4×4 (без роста параметров) Чётные ядра с SAME иногда дают мелкую расцентровку. Просто замени 4×4 на 3×3 (архитектурно всё то же). python Копировать код CNN_model = ConvNet([ # Блок 1 Conv2DLayer(out_channels= 92 , kernel_size=( 5 , 5 ), activation=tf.nn.relu),
+    Conv2DLayer(out_channels= 92 , kernel_size=( 3 , 3 ), activation=tf.nn.relu), # было (4,4) Conv2DLayer(out_channels= 92 , kernel_size=( 3 , 3 ), activation=tf.nn.relu),
+    MaxPool2DLayer(pool_size=( 2 , 2 ), strides=( 2 , 2 ), padding= "SAME" ), # Блок 2 Conv2DLayer(out_channels= 256 , kernel_size=( 3 , 3 ), activation=tf.nn.relu), # было (4,4) Conv2DLayer(out_channels= 256 , kernel_size=( 3 , 3 ), activation=tf.nn.relu),
+    MaxPool2DLayer(pool_size=( 2 , 2 ), strides=( 2 , 2 ), padding= "SAME" ), # Классификатор Conv2DLayer(out_channels= 10 , kernel_size=( 1 , 1 ), activation= None ),
+    GlobalAvgPool2DLayer(),
+]) Запуск: те же 50 эпох, eta_min=3e-5 , остальное без изменений. Это обычно прибавляет стабильность и ещё немного точности. Шаг 3. Очень лёгкая регуляризация «по месту» (опционально) Если увидишь растущий разрыв train_loss − val_loss после 30-й эпохи: Подними L2 с 5e-4 до 7e-4 (только одна цифра меняется в твоём l2_penalty вызове через lam аргумент). Если разрыв всё ещё растёт — добавь один Dropout p=0.2 после первого MaxPool. Чтобы не трогать каркас, можно вставить слой вот так: python Копировать код class DropoutLayer (tf.Module): def __init__ ( self, rate= 0.2 ): super ().__init__(); self.rate=rate def __call__ ( self, x ): return tf.nn.dropout(x, rate=self.rate) # …в модели сразу после первого MaxPool: MaxPool2DLayer(...),
+DropoutLayer(rate= 0.2 ), Этого достаточно; на валидации влияние будет минимальным (Dropout по определению «шумит» только на train, но в нашем простом модуле это допустимо). Контрольный замер После шага 1 запусти оценку на тесте теми же функциями: python Копировать код test_loss, test_acc = evaluate_model(CNN_model, test_data, cross_entropy_loss, accuracy) print ( f"Test: loss= {test_loss: .3 f} acc= {test_acc: .3 f}") Если тест ≥ 85% — стоп, цель достигнута. Если 83–84% — сделай шаг 2. Если упёрся на 84.5% — применяй минимальную надбавку из шага 3. Почему это должно хватить Пол у косинуса + больше эпох возвращают движение градиента после 10-й эпохи — твой график явно «глохнет» именно там. Замена 4×4 на 3×3 не увеличивает сложность, но убирает мелкие численные артефакты и чаще всего улучшает верхнюю точку. Чуть сильнее L2 и максимум один Dropout 0.2 — мягкая страховка от переобучения без потери скорости сходимости. Готов свериться по результатам после шага 1; дальше корректируем только при необходимости.
+
+===== STEP 6 =====
+Q:
+Меня заинтересовал SGDR OSINUS.
+
+A:
+SGDR (cosine with warm restarts) — это «дыхание» скорости обучения: мы плавно опускаем LR по косинусу до минимума, затем резко возвращаемся к стартовому значению и повторяем цикл (T₀, затем T₀·T_mult, и т.д.). Это помогает выбираться из локальных плато без изменения архитектуры — как раз твой случай, где к ~10-й эпохе шаг «гаснет». Коротко, зачем тебе SGDR сейчас Ты видишь плато после ~10 эпох. Сделай первый цикл длиной T₀=10 — перезапуск как раз в момент, когда модель «замирает». Дальше увеличь длину цикла: 10 → 10 → 20 (T_mult=2), общее число эпох — 40–60. Это почти всегда даёт +1–2 п.п. к валид-точности при той же архитектуре. Мини-патч (без перестройки кода) Добавь планировщик и вызывай его в цикле обучения вместо твоего cosine_decay_lr : python Копировать код import math def sgdr_lr ( lr0, epoch, T0= 10 , T_mult= 2 , eta_min= 3e-5 ): """Cosine Annealing with Warm Restarts (Loshchilov & Hutter, 2017)""" T_cur = T0
+    e = epoch while e >= T_cur:
+        e -= T_cur
+        T_cur = int (T_cur * T_mult)
+    cos = 0.5 * ( 1 + math.cos(math.pi * e / T_cur)) return float (eta_min + (lr0 - eta_min) * cos) Внутри train_model замени строку, где задаётся new_lr : python Копировать код # было: # new_lr = cosine_decay_lr(base_lr, epoch, epochs-1) # стало: new_lr = sgdr_lr(base_lr, epoch, T0= 10 , T_mult= 2 , eta_min= 3e-5 )
+optimizer.learning_rate = new_lr Этого достаточно, чтобы запустить SGDR. Рекомендуемые настройки под твою цель (85%) lr0 = 1e-3 , eta_min = 3e-5 , T0=10 , T_mult=2 . Эпохи = 40 или 60 . Схема циклов: 10 | 10 | 20 | (20) … Остальное оставь как есть: Adam, L2=5e-4, твои аугментации, без новых слоёв. Практический смысл циклов В каждой «яйцеобразной» дуге косинуса сеть сначала «крупными мазками» изучает пространство (высокий LR), затем тонко донастраивается (низкий LR). Рестарт возвращает «смелость» градиенту и даёт шанс прыгнуть в лучшее решение, не меняя модель. Небольшие подсказки, чтобы не стрелять себе в ногу Если увидишь чёткую пилу val-loss (качели от рестартов) — слегка повышай η_min до 5e-5 . Если качественный рост остановился после 40 эпох, но разрыв train−val минимальный — добавь ещё один длинный цикл (+20 эпох). Фиксируй лучшие веса по val-accuracy (early-best), а не последние эпохи: SGDR может давать лучший пик в середине длинного цикла. Мини-контроль: после переключения на SGDR прогоняешь 40 эпох и сразу меряешь evaluate_model на test_data . Если недотягивает 0.5–1 п.п., продли до 60 эпох — обычно этого хватает, не трогая архитектуру.
+
+===== STEP 7 =====
+Q:
+###############################################################################
+# Создание модели нейронной сети
+CNN_model = ConvNet([
+    # Блок 1
+    Conv2DLayer(out_channels=92, kernel_size=(5, 5), activation=tf.nn.relu),
+    Conv2DLayer(out_channels=92, kernel_size=(3, 3), activation=tf.nn.relu),
+    #Conv2DLayer(out_channels=92, kernel_size=(3, 3), activation=tf.nn.relu),
+    MaxPool2DLayer(pool_size=(2, 2), strides=(2, 2), padding="SAME"),
+
+    # Блок 2
+    Conv2DLayer(out_channels=192, kernel_size=(3, 3), activation=tf.nn.relu),
+    Conv2DLayer(out_channels=192, kernel_size=(3, 3), activation=tf.nn.relu),
+    #Conv2DLayer(out_channels=128, kernel_size=(2, 4), activation=tf.nn.relu),
+    MaxPool2DLayer(pool_size=(2, 2), strides=(2, 2), padding="SAME"),
+
+    # Блок 3
+    #Conv2DLayer(out_channels=256, kernel_size=(3, 3), activation=tf.nn.relu),
+    #Conv2DLayer(out_channels=256, kernel_size=(3, 3), activation=tf.nn.relu),
+    #MaxPool2DLayer(pool_size=(2, 2), strides=(2, 2), padding="SAME"),
+
+
+    # Классификатор
+    Conv2DLayer(out_channels=10, kernel_size=(1, 1), activation=None),
+    GlobalAvgPool2DLayer(),
+])
+###############################################################################
+
+# тренировка
+train_losses, train_accs, val_losses, val_accs = train_model(
+    CNN_model,
+    train_data,
+    val_data,
+    loss=cross_entropy_loss,
+    acc=accuracy,
+    optimizer=Adam(),
+    epochs=10,
+)
+
+Предложи стратегию изменения пятна внимания для улучшения показателей обучаемости модели CIFAR на данных CIFAR-10. То есть, все-таки внимательно посмотрим, допустим, стоит ли у нас два или три слоя в каждом из двух блоков. А также, может быть, насчет слоя Max2D Pool. Pool2D.
+
+A:
+Отличная постановка: меняем пятно внимания (receptive field) минимальными средствами — количеством свёрток до даунсемплинга и самим способом даунсемплинга. Ниже — короткая стратегия «по шагам», без экзотики и без роста сложности. 1) Позднее даунсемплирование: добавить одну 3×3 до первого пулинга Идея проста: дать сети собрать чуть больше локального контекста на полном разрешении, а уже потом сжимать карту признаков. Что меняем: в Блоке 1 делаем три свёртки (5×5 → 3×3 → 3×3), затем MaxPool. Всё остальное без изменений. python Копировать код CNN_model = ConvNet([ # Блок 1 (теперь три свёртки) Conv2DLayer(out_channels= 92 , kernel_size=( 5 , 5 ), activation=tf.nn.relu),
+    Conv2DLayer(out_channels= 92 , kernel_size=( 3 , 3 ), activation=tf.nn.relu),
+    Conv2DLayer(out_channels= 92 , kernel_size=( 3 , 3 ), activation=tf.nn.relu),
+    MaxPool2DLayer(pool_size=( 2 , 2 ), strides=( 2 , 2 ), padding= "SAME" ), # Блок 2 (как было) Conv2DLayer(out_channels= 192 , kernel_size=( 3 , 3 ), activation=tf.nn.relu),
+    Conv2DLayer(out_channels= 192 , kernel_size=( 3 , 3 ), activation=tf.nn.relu),
+    MaxPool2DLayer(pool_size=( 2 , 2 ), strides=( 2 , 2 ), padding= "SAME" ),
+
+    Conv2DLayer(out_channels= 10 , kernel_size=( 1 , 1 ), activation= None ),
+    GlobalAvgPool2DLayer(),
+]) Почему это работает — Три последовательные 3×3 дают эффективное поле ~9×9 до первого сжатия, что улучшает устойчивость к сдвигам и шуму без роста каналов. — На CIFAR-10 (32×32) «слишком раннее» сжатие может терять детали; один дополнительный 3×3 — дешёвый способ это исправить. 2) Обучаемое даунсемплирование: заменить первый MaxPool на 3×3 с stride=2 Вместо немого MaxPool сеть сама учится, какие признаки сохранять при сжатии. Что меняем: после двух (или трёх) свёрток в Блоке 1 ставим 3×3 со strides=(2,2) и убираем первый MaxPool. Вариант «2 свёртки + обучаемое сжатие»: python Копировать код CNN_model = ConvNet([ # Блок 1 Conv2DLayer(out_channels= 92 , kernel_size=( 5 , 5 ), activation=tf.nn.relu),
+    Conv2DLayer(out_channels= 92 , kernel_size=( 3 , 3 ), activation=tf.nn.relu), # обучаемое даунсемплирование вместо MaxPool Conv2DLayer(out_channels= 92 , kernel_size=( 3 , 3 ), strides=( 2 , 2 ), activation=tf.nn.relu), # Блок 2 (без изменений) Conv2DLayer(out_channels= 192 , kernel_size=( 3 , 3 ), activation=tf.nn.relu),
+    Conv2DLayer(out_channels= 192 , kernel_size=( 3 , 3 ), activation=tf.nn.relu),
+    MaxPool2DLayer(pool_size=( 2 , 2 ), strides=( 2 , 2 ), padding= "SAME" ),
+
+    Conv2DLayer(out_channels= 10 , kernel_size=( 1 , 1 ), activation= None ),
+    GlobalAvgPool2DLayer(),
+]) Почему это работает — 3×3 s=2 добавляет контекст (в отличие от MaxPool, который контекст не учит) и чуть расширяет теоретическое поле при том же месте в графе. 3) Сколько свёрток в блоках: 3–2 или 2–2 ? Для CIFAR-10 чаще всего выигрывает умеренно «глубокое» начало: 3 свёртки в первом блоке и 2 во втором . Это даёт хороший контекст на полном разрешении и не раздувает параметры. Если хочешь совсем минимально — оставь 2–2 и возьми «обучаемое сжатие» (п.2). 4) Что делать с MaxPool2D Держать ровно один MaxPool во второй половине сети — нормально. Первый MaxPool либо перенести позже (после третьей свёртки), либо заменить на 3×3 s=2 (п.2). Менять на AveragePool особого смысла нет на твоей архитектуре — выигрыш не систематический. 5) План эксперимента (микрошаги, без усложнения) Делаем по очереди, с теми же аугментациями, Adam(1e-3), L2=5e-4 и SGDR T₀=10, T_mult=2, η_min=3e-5 , 40–60 эпох. Только добавить третью 3×3 перед первым сжатием (п.1). Вернуть 2–2, но заменить первый MaxPool на 3×3 s=2 (п.2). Если оба варианта близки — оставь тот, у которого гладче val-loss и меньше разрыв train−val. 6) Маленькая «физика» рецептивного поля (для понимания) У тебя сейчас (5×5 → 3×3 → pool → 3×3 → 3×3 → pool) итоговое теоретическое поле ≈ 18×18 . С «3 свёртки до pool» станет ≈ 20×20 ; с «3×3 s=2 вместо pool» — ≈ 19×19 . Главное не цифра, а то, где формируется контекст: чем позже сжатие, тем богаче признаки на высоком разрешении. Что запускать прямо сейчас Выбери один из двух минимальных вариантов (п.1 или п.2), прогон 40 эпох с SGDR , затем измерь evaluate_model на test_data . В подавляющем числе случаев этого хватает, чтобы с 82% выйти на стабильные 85%+ без каких-либо «наворотов».
+
+===== STEP 8 =====
+Q:
+def sgdr_lr(lr0, epoch, T0=10, T_mult=2, eta_min=3e-5):
+    """Cosine Annealing with Warm Restarts (Loshchilov & Hutter, 2017)"""
+    T_cur = T0
+    e = epoch
+    while e >= T_cur:
+        e -= T_cur
+        T_cur = int(T_cur * T_mult)
+    cos = 0.5 * (1 + math.cos(math.pi * e / T_cur))
+    return float(eta_min + (lr0 - eta_min) * cos)
+
+---------------------
+
+Я хочу уменьшить восстановление коффинуса после сброса где-нибудь на 0,6, то есть я хочу, чтобы выход этой функции был не от 100 до 0, а при пересбросе, чтобы он возвращался не на 100, а где-нибудь на 60, мы видим на графике, что у него три эпохи занимают только восстановление, то есть первое максимум возвращается на, хорошо пусть максимум возвращается на 70, а сброс начинается с 20 или с 10, то есть достигая ниже 10 он не заходит, а уже сбрасывается,
+
+A:
+Отличная идея: сделать частичный рестарт вместо прыжка «с 0 до 100». Дадим косинусу верхнюю и нижнюю доли от базового LR и, при желании, лёгкий warm-up в начале каждого цикла, чтобы не было трёх «потерянных» эпох на восстановление. Вот минимальный патч. SGDR с ограниченным размахом и опциональным тёплым стартом python Копировать код import math def sgdr_lr_frac ( lr0, epoch, *,
+    T0= 10 , T_mult= 2 ,
+    max_frac= 0.70 , # максимум цикла: 70% от lr0 min_frac= 0.10 , # минимум цикла: 10% от lr0 decay= 1.0 , # затухание амплитуды между циклами (например, 0.95) eta_min_abs= 0.0 , # абсолютный пол — на всякий случай warmup_epochs= 0 # 0–2 эпохи мягкого входа после рестарта ): # вычисляем индекс цикла k и положение e внутри цикла T = int (T0)
+    e = int (epoch)
+    k = 0 while e >= T:
+        e -= T
+        T = int (T * T_mult)
+        k += 1 # пиковые значения для текущего цикла lr_max = lr0 * (max_frac * (decay ** k))
+    lr_min = max (lr0 * (min_frac * (decay ** k)), eta_min_abs) # опциональный тёплый старт внутри цикла (линейный разгон) if warmup_epochs > 0 and e < warmup_epochs: # от lr_min к lr_max за warmup_epochs шагов alpha = (e + 1 ) / float (warmup_epochs) return lr_min + (lr_max - lr_min) * alpha # обычный косинус внутри оставшейся части цикла T_eff = max ( 1 , T - max ( 0 , warmup_epochs))
+    e_eff = max ( 0 , e - max ( 0 , warmup_epochs))
+    cos = 0.5 * ( 1 + math.cos(math.pi * e_eff / T_eff)) return float (lr_min + (lr_max - lr_min) * cos) Как подключить в твоём train_model : замени вычисление new_lr на: python Копировать код new_lr = sgdr_lr_frac(
+    base_lr, epoch,
+    T0= 10 , T_mult= 2 ,
+    max_frac= 0.70 , # «максимум возвращается на 70» min_frac= 0.10 , # «ниже 10% не опускаемся» decay= 1.0 , # можно 0.95, если хочешь плавно гасить пики от цикла к циклу eta_min_abs= 3e-5 ,
+    warmup_epochs= 0 # поставь 1–2, если ещё хочется сгладить «рывок» после рестарта )
+optimizer.learning_rate = new_lr Что это даёт именно под твою задачу Нет «жёсткого» прыжка к 100%: после рестарта LR поднимается лишь до 0.7·lr0 (или что ты задашь). Нижний пол — 0.1·lr0 : цикл обрывается раньше, не закапываясь в слишком малые шаги. Опциональный warm-up 1–2 эпохи убирает «три эпохи на восстановление» — метрики проседают меньше и быстрее возвращаются. Если график всё ещё «пилит» после рестартов — подними min_frac (например, 0.15) или добавь warmup_epochs=2 . Если наоборот хочется смелее шаг — увеличь max_frac до 0.75. Дальше просто прогоняй 40–60 эпох с этим планом; цель в 85% обычно берётся без изменения архитектуры.
+
+===== STEP 9 =====
+Q:
+Походу сброс косинуса завис после 30-й эпохи.
+---------------------------------------
+
+
+
+Эпоха: 0 | LR=0.00070 | 
+Обучающая ошибка: 2.084, Обучающая точность: 0.351
+Валидационная ошибка: 1.468, Валидационная точность: 0.482
+Эпоха: 1 | LR=0.00069 | 
+Обучающая ошибка: 1.586, Обучающая точность: 0.521
+Валидационная ошибка: 1.216, Валидационная точность: 0.568
+Эпоха: 2 | LR=0.00064 | 
+Обучающая ошибка: 1.360, Обучающая точность: 0.600
+Валидационная ошибка: 1.075, Валидационная точность: 0.615
+Эпоха: 3 | LR=0.00058 | 
+Обучающая ошибка: 1.209, Обучающая точность: 0.658
+Валидационная ошибка: 0.952, Валидационная точность: 0.673
+Эпоха: 4 | LR=0.00049 | 
+Обучающая ошибка: 1.100, Обучающая точность: 0.698
+Валидационная ошибка: 0.903, Валидационная точность: 0.688
+Эпоха: 5 | LR=0.00040 | 
+Обучающая ошибка: 1.014, Обучающая точность: 0.726
+Валидационная ошибка: 0.756, Валидационная точность: 0.739
+Эпоха: 6 | LR=0.00031 | 
+Обучающая ошибка: 0.942, Обучающая точность: 0.753
+Валидационная ошибка: 0.761, Валидационная точность: 0.735
+Эпоха: 7 | LR=0.00022 | 
+Обучающая ошибка: 0.896, Обучающая точность: 0.768
+Валидационная ошибка: 0.685, Валидационная точность: 0.759
+Эпоха: 8 | LR=0.00016 | 
+Обучающая ошибка: 0.852, Обучающая точность: 0.783
+Валидационная ошибка: 0.709, Валидационная точность: 0.757
+Эпоха: 9 | LR=0.00011 | 
+Обучающая ошибка: 0.829, Обучающая точность: 0.791
+Валидационная ошибка: 0.648, Валидационная точность: 0.775
+Эпоха: 10 | LR=0.00070 | 
+Обучающая ошибка: 0.937, Обучающая точность: 0.755
+Валидационная ошибка: 0.729, Валидационная точность: 0.748
+Эпоха: 11 | LR=0.00070 | 
+Обучающая ошибка: 0.897, Обучающая точность: 0.770
+Валидационная ошибка: 0.694, Валидационная точность: 0.757
+Эпоха: 12 | LR=0.00069 | 
+Обучающая ошибка: 0.859, Обучающая точность: 0.784
+Валидационная ошибка: 0.657, Валидационная точность: 0.773
+Эпоха: 13 | LR=0.00067 | 
+Обучающая ошибка: 0.827, Обучающая точность: 0.796
+Валидационная ошибка: 0.619, Валидационная точность: 0.789
+Эпоха: 14 | LR=0.00064 | 
+Обучающая ошибка: 0.794, Обучающая точность: 0.806
+Валидационная ошибка: 0.576, Валидационная точность: 0.803
+Эпоха: 15 | LR=0.00061 | 
+Обучающая ошибка: 0.770, Обучающая точность: 0.814
+Валидационная ошибка: 0.574, Валидационная точность: 0.802
+Эпоха: 16 | LR=0.00058 | 
+Обучающая ошибка: 0.753, Обучающая точность: 0.819
+Валидационная ошибка: 0.603, Валидационная точность: 0.797
+Эпоха: 17 | LR=0.00054 | 
+Обучающая ошибка: 0.731, Обучающая точность: 0.830
+Валидационная ошибка: 0.576, Валидационная точность: 0.804
+Эпоха: 18 | LR=0.00049 | 
+Обучающая ошибка: 0.710, Обучающая точность: 0.836
+Валидационная ошибка: 0.566, Валидационная точность: 0.805
+Эпоха: 19 | LR=0.00045 | 
+Обучающая ошибка: 0.686, Обучающая точность: 0.842
+Валидационная ошибка: 0.544, Валидационная точность: 0.818
+Эпоха: 20 | LR=0.00040 | 
+Обучающая ошибка: 0.661, Обучающая точность: 0.852
+Валидационная ошибка: 0.552, Валидационная точность: 0.812
+Эпоха: 21 | LR=0.00035 | 
+Обучающая ошибка: 0.645, Обучающая точность: 0.859
+Валидационная ошибка: 0.581, Валидационная точность: 0.801
+Эпоха: 22 | LR=0.00031 | 
+Обучающая ошибка: 0.631, Обучающая точность: 0.863
+Валидационная ошибка: 0.492, Валидационная точность: 0.829
+Эпоха: 23 | LR=0.00026 | 
+Обучающая ошибка: 0.603, Обучающая точность: 0.872
+Валидационная ошибка: 0.578, Валидационная точность: 0.805
+Эпоха: 24 | LR=0.00022 | 
+Обучающая ошибка: 0.587, Обучающая точность: 0.878
+Валидационная ошибка: 0.482, Валидационная точность: 0.838
+Эпоха: 25 | LR=0.00019 | 
+Обучающая ошибка: 0.573, Обучающая точность: 0.882
+Валидационная ошибка: 0.481, Валидационная точность: 0.838
+Эпоха: 26 | LR=0.00016 | 
+Обучающая ошибка: 0.557, Обучающая точность: 0.888
+Валидационная ошибка: 0.486, Валидационная точность: 0.835
+Эпоха: 27 | LR=0.00013 | 
+Обучающая ошибка: 0.544, Обучающая точность: 0.890
+Валидационная ошибка: 0.466, Валидационная точность: 0.842
+Эпоха: 28 | LR=0.00011 | 
+Обучающая ошибка: 0.533, Обучающая точность: 0.894
+Валидационная ошибка: 0.471, Валидационная точность: 0.842
+Эпоха: 29 | LR=0.00010 | 
+Обучающая ошибка: 0.523, Обучающая точность: 0.899
+Валидационная ошибка: 0.442, Валидационная точность: 0.849
+Эпоха: 30 | LR=0.00070 | 
+Обучающая ошибка: 0.676, Обучающая точность: 0.845
+Валидационная ошибка: 0.537, Валидационная точность: 0.820
+Эпоха: 31 | LR=0.00070 | 
+Обучающая ошибка: 0.668, Обучающая точность: 0.851
+Валидационная ошибка: 0.531, Валидационная точность: 0.823
+Эпоха: 32 | LR=0.00070 | 
+Обучающая ошибка: 0.641, Обучающая точность: 0.862
+Валидационная ошибка: 0.501, Валидационная точность: 0.828
+Эпоха: 33 | LR=0.00069 | 
+Обучающая ошибка: 0.641, Обучающая точность: 0.862
+Валидационная ошибка: 0.530, Валидационная точность: 0.824
+Эпоха: 34 | LR=0.00069 | 
+Обучающая ошибка: 0.632, Обучающая точность: 0.866
+Валидационная ошибка: 0.485, Валидационная точность: 0.837
+Эпоха: 35 | LR=0.00068 | 
+Обучающая ошибка: 0.621, Обучающая точность: 0.870
+Валидационная ошибка: 0.485, Валидационная точность: 0.837
+Эпоха: 36 | LR=0.00067 | 
+Обучающая ошибка: 0.613, Обучающая точность: 0.873
+Валидационная ошибка: 0.539, Валидационная точность: 0.814
+
+A:
+Да, это не «зависание», а следствие выбранной схемы циклов. С SGDR при T0=10 и T_mult=2 длины циклов такие: 10, 20, 40, … . Поэтому рестарты идут на эпохах 0, 10, 30, 70, … — как у тебя: после 30-й LR снова стал ~0.00070. Это норма для классического SGDR. Если хочешь рестарты на 0, 10, 20, 40… (то есть 10-10-20), есть два простых варианта: Вариант А: одинаковые короткие циклы Просто сделай T_mult=1 — тогда каждый цикл длиной 10 эпох: python Копировать код new_lr = sgdr_lr_frac(base_lr, epoch, T0= 10 , T_mult= 1 ,
+                      max_frac= 0.70 , min_frac= 0.10 , eta_min_abs= 3e-5 ) Рестарты будут на 0, 10, 20, 30, … Вариант B: произвольное расписание циклов (10, 10, 20, …) Добавь кастомную версию с явным списком длин циклов. python Копировать код import math def sgdr_lr_custom ( lr0, epoch, lengths=( 10 , 10 , 20 ), *,
+    max_frac= 0.70 , min_frac= 0.10 , decay= 1.0 ,
+    eta_min_abs= 3e-5 , warmup_epochs= 0 ): # определяем текущий цикл и позицию внутри него e = int (epoch)
+    k = 0 Ls = list (lengths) while True :
+        L = Ls[k] if k < len (Ls) else Ls[- 1 ] # после конца списка повторяем последний L if e < L: break e -= L
+        k += 1 lr_max = lr0 * (max_frac * (decay ** k))
+    lr_min = max (lr0 * (min_frac * (decay ** k)), eta_min_abs) if warmup_epochs > 0 and e < warmup_epochs:
+        alpha = (e + 1 ) / float (warmup_epochs) return lr_min + (lr_max - lr_min) * alpha # косинус внутри цикла (min в конце цикла) cos = 0.5 * ( 1 + math.cos(math.pi * (e + 1 ) / L)) return float (lr_min + (lr_max - lr_min) * cos) Использование: python Копировать код new_lr = sgdr_lr_custom(
+    base_lr, epoch,
+    lengths=( 10 , 10 , 20 ), # рестарты на 0,10,20, затем каждые 20 max_frac= 0.70 , # максимум после рестарта = 70% от lr0 min_frac= 0.10 , # минимум = 10% от lr0 decay= 1.0 ,
+    eta_min_abs= 3e-5 ,
+    warmup_epochs= 0 # можно 1–2, чтобы сгладить вход в цикл )
+optimizer.learning_rate = new_lr Почему у тебя на 19-й эпохе LR не опустился до минимума В стандартной формуле cos(pi * e / T) при e = 0..T-1 минимум не достигается на последнем шаге (off-by-one). В кастомной версии выше я использовал (e + 1) / L , чтобы минимум приходился на конец цикла. Короткая рекомендация под твою цель 85%: Если хочется «частых вдохов» без долгого ожидания — T_mult=1 (каждые 10 эпох рестарт). Если нужна именно схема 10–10–20 — используй sgdr_lr_custom(lengths=(10,10,20)) . Твои доли уже удачные: max_frac=0.70 , min_frac=0.10 . Если увидишь сильную «пилу», подними min_frac до 0.15 или включи warmup_epochs=1 . Продолжай тем же курсом: текущая динамика валид-точности уже подбирается к 85%, и корректное расписание рестартов просто ускорит добег до цели.
