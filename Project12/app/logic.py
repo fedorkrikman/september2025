@@ -13,19 +13,67 @@ quiz_data = [
         'correct_option': 0
     },
     # Добавьте другие вопросы
+    {
+        'question': 'Какой тип данных используется для хранения вещественных чисел?',
+        'options': ['float', 'int', 'complex', 'double'],
+        'correct_option': 0
+    },
+    {
+        'question': 'Какой оператор используется для возведения в степень?',
+        'options': ['**', '^', 'exp()', '//'],
+        'correct_option': 0
+    },
+    {
+        'question': 'Как называется структура данных, изменяемая и индексируемая, позволяющая хранить последовательности?',
+        'options': ['list', 'tuple', 'set', 'dict'],
+        'correct_option': 0
+    },
+    {
+        'question': 'Какой тип данных представляет неизменяемую последовательность?',
+        'options': ['tuple', 'list', 'set', 'dict'],
+        'correct_option': 0
+    },
+    {
+        'question': 'Какой метод строки позволяет перевести её в нижний регистр?',
+        'options': ['lower()', 'down()', 'to_lower()', 'small()'],
+        'correct_option': 0
+    },
+    {
+        'question': 'Какой оператор сравнения проверяет равенство значений?',
+        'options': ['==', '=', '!=', '==='],
+        'correct_option': 0
+    },
+    {
+        'question': 'Какой цикл используется для перебора элементов последовательности?',
+        'options': ['for', 'while', 'loop', 'repeat'],
+        'correct_option': 0
+    },
+    {
+        'question': 'Как называется структура данных, использующая пары «ключ–значение»?',
+        'options': ['dict', 'list', 'tuple', 'array'],
+        'correct_option': 0
+    },
+    {
+        'question': 'Какой встроенный тип данных представляет множество уникальных элементов?',
+        'options': ['set', 'list', 'dict', 'array'],
+        'correct_option': 0
+    },
+    {
+        'question': 'Какой оператор используется для целочисленного деления?',
+        'options': ['//', '/', '%', 'div'],
+        'correct_option': 0
+    },
 ]
 
 
-async def new_quiz(message, question_index: int = 0):
-    """Запускает новый квиз или продолжает существующий"""
-    from app.db.quiz import update_quiz_index
+async def new_quiz(message, user_id: int, question_index: int = 0):
+    """Запускает новый квиз или продолжает существующий. Возвращает True, если вопрос отправлен."""
+    from app.db.quiz import set_question_index
     from aiogram.utils.keyboard import InlineKeyboardBuilder
     from aiogram import types
     
     if question_index >= len(quiz_data):
-        await message.answer("Квиз завершен! Спасибо за участие!")
-        await update_quiz_index(message.from_user.id, 0)
-        return
+        return False
     
     question = quiz_data[question_index]
     
@@ -43,5 +91,5 @@ async def new_quiz(message, question_index: int = 0):
         reply_markup=builder.as_markup()
     )
     
-    await update_quiz_index(message.from_user.id, question_index)
-
+    await set_question_index(user_id, question_index)
+    return True

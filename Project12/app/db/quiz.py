@@ -1,5 +1,6 @@
 import aiosqlite
 from pathlib import Path
+from typing import Optional, Dict, Any
 from app.config import DATABASE_URL
 
 # Извлекаем путь к БД и делаем его абсолютным
@@ -11,26 +12,80 @@ else:
     DB_NAME = _db_path
 
 
-async def update_quiz_index(user_id: int, index: int):
-    """Обновляет индекс текущего вопроса для пользователя"""
-    # Создаем соединение с базой данных (если она не существует, она будет создана)
+async def start_quiz_session(user_id: int, username: str) -> None:
+    """Запускает (или перезапускает) квиз для пользователя."""
     async with aiosqlite.connect(DB_NAME) as db:
-        # Вставляем новую запись или заменяем ее, если с данным user_id уже существует
-        await db.execute('INSERT OR REPLACE INTO quiz_state (user_id, question_index) VALUES (?, ?)', (user_id, index))
-        # Сохраняем изменения
+        await db.execute(
+            '''
+            INSERT INTO quiz_state (user_id, username, question_index, correct_answers, incorrect_answers, is_active)
+            VALUES (?, ?, 0, 0, 0, 1)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                question_index = 0,
+                correct_answers = 0,
+                incorrect_answers = 0,
+                is_active = 1
+            ''',
+            (user_id, username),
+        )
         await db.commit()
 
 
-async def get_quiz_index(user_id: int) -> int:
-    """Получает индекс текущего вопроса для пользователя"""
-    # Подключаемся к базе данных
+async def set_question_index(user_id: int, index: int) -> None:
+    """Сохраняет текущий индекс вопроса для пользователя."""
     async with aiosqlite.connect(DB_NAME) as db:
-        # Получаем запись для заданного пользователя
-        async with db.execute('SELECT question_index FROM quiz_state WHERE user_id = (?)', (user_id,)) as cursor:
-            # Возвращаем результат
-            results = await cursor.fetchone()
-            if results is not None:
-                return results[0]
-            else:
-                return 0
+        await db.execute(
+            'UPDATE quiz_state SET question_index = ? WHERE user_id = ?',
+            (index, user_id)
+        )
+        await db.commit()
 
+
+async def record_answer(user_id: int, is_correct: bool) -> None:
+    """Обновляет статистику ответов пользователя."""
+    column = "correct_answers" if is_correct else "incorrect_answers"
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            f'UPDATE quiz_state SET {column} = {column} + 1 WHERE user_id = ?',
+            (user_id,)
+        )
+        await db.commit()
+
+
+async def finish_quiz_session(user_id: int) -> Optional[Dict[str, Any]]:
+    """Помечает квиз как завершенный и возвращает статистику пользователя."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            '''
+            SELECT user_id, username, question_index, correct_answers, incorrect_answers, is_active
+            FROM quiz_state WHERE user_id = ?
+            ''',
+            (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        await db.execute(
+            'UPDATE quiz_state SET is_active = 0, question_index = 0 WHERE user_id = ?',
+            (user_id,)
+        )
+        await db.commit()
+        return dict(row)
+
+
+async def get_quiz_state(user_id: int) -> Optional[Dict[str, Any]]:
+    """Возвращает текущее состояние квиза пользователя."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            '''
+            SELECT user_id, username, question_index, correct_answers, incorrect_answers, is_active
+            FROM quiz_state WHERE user_id = ?
+            ''',
+            (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            return dict(row)
